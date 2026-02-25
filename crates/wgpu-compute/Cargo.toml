@@ -1,0 +1,14 @@
+[package]
+name = "wgpu-compute"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Makes it easy to call wgsl code from Rust."
+readme = "README.md"
+
+[dependencies]
+futures = "0.3.31"
+wgpu = "28.0.0"
+bytemuck = "1.25.0"
+log = "0.4.29"
+wgpu-compute-macro = { path = "../wgpu-compute-macro" }

@@ -1,0 +1,16 @@
+[package]
+name = "wgpu-compute-macro"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Provides macros for the wgpu-compute crate."
+readme = "README.md"
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+naga = { version = "26.0", features = ["wgsl-in", "wgsl-out"] }
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+quote = "1.0"
+
+[lib]
+proc-macro = true

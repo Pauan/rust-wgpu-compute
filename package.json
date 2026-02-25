@@ -1,0 +1,14 @@
+{
+  "private": true,
+  "name": "gpu",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "rimraf dist/js && rollup --config"
+  },
+  "devDependencies": {
+    "@wasm-tool/rollup-plugin-rust": "^3.1.4",
+    "rimraf": "^6.1.2",
+    "rollup": "^4.57.1"
+  }
+}
