@@ -112,6 +112,17 @@ impl Gpu {
         }
     }
 
+    pub fn bind_group<'a, A>(input: &'a Input<A>) -> wgpu::BindingResource<'a> {
+        match &input.buffer {
+            Buffer::Gpu(buffer) => {
+                buffer.as_entire_binding()
+            },
+            Buffer::Cpu(_) => {
+                panic!("Cannot create bind group from CPU Buffer");
+            },
+        }
+    }
+
 
     fn output_buffer(&self, input_buffer: &wgpu::Buffer) -> wgpu::Buffer {
         // We have to use a separate buffer for transferring from the GPU to the CPU,

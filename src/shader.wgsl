@@ -2,10 +2,10 @@
 var<storage, read> input: array<f32>;
 
 @group(0) @binding(1)
-var<storage, read_write> output: array<f64>;
+var<storage, read_write> output: array<f32>;
 
-fn double_(input: f32) -> f64 {
-    return f64(input) * 2.0;
+fn double_(input: f32) -> f32 {
+    return input * 2.0;
 }
 
 @compute @workgroup_size(64)

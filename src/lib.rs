@@ -12,7 +12,7 @@ mod gpu {
 }
 
 
-async fn double(values: Vec<f32>) -> Vec<f64> {
+async fn double(values: Vec<f32>) -> Vec<f32> {
     let threads = values.len();
 
     let mut state = wgpu_compute::State::new(gpu::Bindings {

@@ -45,7 +45,7 @@ impl Module {
     fn validate(&self) -> Result<naga::valid::ModuleInfo, syn::Error> {
         let mut validator = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
+            naga::valid::Capabilities::empty(),
         );
 
         validator.subgroup_stages(naga::valid::ShaderStages::all())
