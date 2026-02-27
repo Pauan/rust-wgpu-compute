@@ -1,22 +1,19 @@
 use wasm_bindgen::prelude::*;
+use bytemuck::Zeroable;
 
 
 mod gpu {
-    use wgpu_compute::import_wgpu_compute;
-
-    import_wgpu_compute! {
+    wgpu_compute::import_wgpu_compute! {
         file: "./shader.wgsl",
     }
-
-    //pub use double;
 }
 
 
-async fn double(values: Vec<f32>) -> Vec<f32> {
+async fn double(values: Vec<gpu::Input>) -> Vec<gpu::Output> {
     let threads = values.len();
 
     let mut state = wgpu_compute::State::new(gpu::Bindings {
-        output: vec![0.0; values.len()],
+        output: vec![Zeroable::zeroed(); values.len()],
         input: values,
     }).await;
 
@@ -35,7 +32,7 @@ pub async fn main_js() -> Result<(), JsValue> {
 
     log::info!("STARTING");
 
-    let output = double(vec![0.0, 2.0, 6.0, 10.0, 30.0, 60.0, 100.0]).await;
+    let output = double(vec![0.0, 2.0, 6.0, 10.0, 30.0, 60.0, 100.0].into_iter().map(|value| gpu::Input { value }).collect()).await;
 
     log::info!("{:?}", output);
 

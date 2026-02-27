@@ -168,7 +168,7 @@ fn typedef_to_rust(span: Span, handle: Handle<Type>, module: &Module) -> Result<
                 let ty = RustType::new(span, member.ty, module)?;
                 let ty = ty.tokens();
 
-                Ok(quote! { #name: #ty, })
+                Ok(quote! { pub #name: #ty, })
             }).collect::<Result<Vec<_>, syn::Error>>()?;
 
             Ok(quote! {
