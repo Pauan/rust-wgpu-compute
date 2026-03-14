@@ -126,11 +126,15 @@ impl Input {
         let source = module.to_source(&info)?;
 
         let generate = generate::Generate {
-            span: module.span,
+            source: module.source,
+            path: module.path,
             module: module.module,
-        }.to_tokens(source)?;
+        };
 
-        Ok(generate.into())
+        Ok(generate
+            .to_tokens(source)
+            .map_err(|e| syn::Error::new(module.span, e.message))?
+            .into())
     }
 
 

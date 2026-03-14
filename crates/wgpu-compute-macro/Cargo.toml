@@ -10,6 +10,7 @@ readme = "README.md"
 syn = { version = "2.0", features = ["full"] }
 naga = { version = "26.0", features = ["wgsl-in", "wgsl-out"] }
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
+codespan-reporting = "0.13.1"
 quote = "1.0"
 
 [lib]
