@@ -15,7 +15,7 @@ export default {
                 release: false
             },
             extraArgs: {
-                rustc: ["--cfg", "web_sys_unstable_apis"],
+                rustc: ["--cfg", "web_sys_unstable_apis", "-Z", "proc-macro-backtrace"],
             },
         }),
     ],

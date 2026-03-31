@@ -18,6 +18,10 @@ const BAR: vec2<f32> = vec2<f32>(5.0, 1.0);
 
 const QUX: mat2x3f = mat2x3f(1.0, 2.0, 3.0, 4.0, 5.0, 6.0);
 
+fn double_(value: f32) -> f32 {
+    return value * 2.0;
+}
+
 @compute @workgroup_size(64)
 fn double(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let index = global_id.x;
@@ -26,5 +30,5 @@ fn double(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    output[index].value = input[index].value * 2.0;
+    output[index].value = double_(input[index].value);
 }

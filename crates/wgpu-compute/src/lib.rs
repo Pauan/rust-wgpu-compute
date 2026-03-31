@@ -157,6 +157,7 @@ impl Gpu {
 }
 
 
+#[allow(unused)]
 enum Buffer<A> {
     Gpu(wgpu::Buffer),
     Cpu(A),
@@ -172,14 +173,14 @@ pub struct Output<A> {
     buffer: Buffer<Option<A>>,
 }
 
-impl<A> Output<A> {
+/*impl<A> Output<A> {
     fn buffer(&self) -> &wgpu::Buffer {
         match &self.buffer {
             Buffer::Gpu(buffer) => buffer,
             Buffer::Cpu(_) => unreachable!(),
         }
     }
-}
+}*/
 
 impl<A> Output<A> where A: bytemuck::AnyBitPattern {
     pub fn value(&self) -> A {
@@ -281,7 +282,7 @@ impl<A, B> State<A, B> {
                 }
             },
 
-            __internal::State::Cpu(cpu) => {
+            __internal::State::Cpu(_cpu) => {
                 todo!();
             },
         }

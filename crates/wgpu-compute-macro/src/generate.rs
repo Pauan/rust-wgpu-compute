@@ -71,10 +71,20 @@ impl RustType {
 }
 
 
+struct Var(Handle<Expression>);
+
+impl std::fmt::Display for Var {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.write_prefixed(f, "v")
+    }
+}
+
+
 pub struct Generate {
     pub source: String,
     pub path: String,
     pub module: Module,
+    pub named_expressions: naga::FastIndexMap<Handle<Expression>, String>,
 }
 
 impl Generate {
@@ -106,6 +116,17 @@ impl Generate {
             VectorSize::Tri => 3,
             VectorSize::Quad => 4,
         }
+    }
+
+
+    fn var_name(&self, handle: Handle<Expression>) -> syn::Ident {
+        let name = Var(handle).to_string();
+
+        let ident = format_ident!("{}", name);
+
+        //self.named_expressions.borrow_mut().insert(handle, name);
+
+        ident
     }
 
 
@@ -301,7 +322,7 @@ impl Generate {
     }
 
 
-    fn parse_expression(&self, arena: &Arena<Expression>, handle: Handle<Expression>) -> Result<proc_macro2::TokenStream, GenerateError> {
+    fn parse_const_expression(&self, arena: &Arena<Expression>, handle: Handle<Expression>) -> Result<proc_macro2::TokenStream, GenerateError> {
         let expression = &arena[handle];
 
         match expression {
@@ -329,7 +350,7 @@ impl Generate {
                     Ok(quote! { #name })
 
                 } else {
-                    self.parse_expression(&self.module.global_expressions, value.init)
+                    self.parse_const_expression(&self.module.global_expressions, value.init)
                 }
             },
 
@@ -341,25 +362,211 @@ impl Generate {
                     Ok(quote! { #name })
 
                 } else if let Some(init) = value.init {
-                    self.parse_expression(&self.module.global_expressions, init)
+                    self.parse_const_expression(&self.module.global_expressions, init)
 
                 } else {
                     Err(self.error(self.module.overrides.get_span(*handle), "override must have a default value"))
                 }
             },
 
-            Expression::ZeroValue(handle) => todo!(),
-
             Expression::Compose { ty, components } => {
                 let values = components.into_iter().map(|value| {
-                    self.parse_expression(arena, *value)
+                    self.parse_const_expression(arena, *value)
                 }).collect::<Result<Vec<_>, _>>()?;
 
                 self.parse_compose(arena.get_span(handle), *ty, values)
             },
 
-            _ => todo!(),
+            Expression::ZeroValue(handle) => {
+                todo!();
+            },
+
+            Expression::Splat { size, value } => {
+                todo!();
+            },
+
+            _ => {
+                println!("{:#?}", expression);
+                todo!();
+                unreachable!();
+            },
         }
+    }
+
+
+    fn parse_func_expression(&self, func: &Function, handle: Handle<Expression>) -> Result<proc_macro2::TokenStream, GenerateError> {
+        let expression = &func.expressions[handle];
+
+        match expression {
+            Expression::CallResult(handle) => {
+                let function = &self.module.functions[*handle];
+
+                println!("{:#?}", function.named_expressions);
+
+                todo!();
+            },
+
+            Expression::AccessIndex { base, index } => {
+                let base = self.parse_func_expression(func, *base)?;
+                Ok(quote! { #base[#index] })
+            },
+
+            Expression::Access { base, index } => {
+                let base = self.parse_func_expression(func, *base)?;
+                let index = self.parse_func_expression(func, *index)?;
+                Ok(quote! { #base[#index] })
+            },
+
+            Expression::Load { pointer } => {
+                let pointer = self.parse_func_expression(func, *pointer)?;
+                Ok(quote! { #pointer })
+            },
+
+            Expression::GlobalVariable(handle) => {
+                let var = &self.module.global_variables[*handle];
+                let name = format_ident!("{}", var.name.as_ref().unwrap());
+
+                Ok(quote! { #name })
+            },
+
+            Expression::ArrayLength(handle) => {
+                let value = self.parse_func_expression(func, *handle)?;
+                Ok(quote! { #value.len() })
+            },
+
+            Expression::Binary { op, left, right } => {
+                let left = self.parse_func_expression(func, *left)?;
+                let right = self.parse_func_expression(func, *right)?;
+
+                Ok(match op {
+                    BinaryOperator::Add => quote! { #left + #right },
+                    BinaryOperator::Subtract => quote! { #left - #right },
+                    BinaryOperator::Multiply => quote! { #left * #right },
+                    BinaryOperator::Divide => quote! { #left / #right },
+                    BinaryOperator::Modulo => quote! { #left % #right },
+                    BinaryOperator::Equal => quote! { #left == #right },
+                    BinaryOperator::NotEqual => quote! { #left != #right },
+                    BinaryOperator::Less => quote! { #left < #right },
+                    BinaryOperator::LessEqual => quote! { #left <= #right },
+                    BinaryOperator::Greater => quote! { #left > #right },
+                    BinaryOperator::GreaterEqual => quote! { #left >= #right },
+                    BinaryOperator::And => quote! { #left & #right },
+                    BinaryOperator::ExclusiveOr => quote! { #left ^ #right },
+                    BinaryOperator::InclusiveOr => quote! { #left | #right },
+                    BinaryOperator::LogicalAnd => quote! { #left && #right },
+                    BinaryOperator::LogicalOr => quote! { #left || #right },
+                    BinaryOperator::ShiftLeft => quote! { #left << #right },
+                    BinaryOperator::ShiftRight => quote! { #left >> #right },
+                })
+            },
+
+            Expression::FunctionArgument(index) => {
+                let arg = &func.arguments[*index as usize];
+                let name = format_ident!("{}", arg.name.as_ref().unwrap());
+                Ok(quote! { #name })
+            },
+
+            Expression::Compose { ty, components } => {
+                let values = components.into_iter().map(|value| {
+                    self.parse_func_expression(func, *value)
+                }).collect::<Result<Vec<_>, _>>()?;
+
+                self.parse_compose(func.expressions.get_span(handle), *ty, values)
+            },
+
+            _ => self.parse_const_expression(&func.expressions, handle),
+        }
+    }
+
+
+    fn parse_block(&self, func: &Function, block: &Block) -> Result<proc_macro2::TokenStream, GenerateError> {
+        let statements = block.into_iter().map(|statement| {
+            self.parse_statement(func, statement)
+        }).collect::<Result<Vec<_>, _>>()?;
+
+        Ok(quote! { #(#statements)* })
+    }
+
+
+    fn parse_statement(&self, func: &Function, statement: &Statement) -> Result<proc_macro2::TokenStream, GenerateError> {
+        match statement {
+            Statement::Block(block) => {
+                self.parse_block(func, block)
+            },
+            Statement::If { condition, accept, reject } => {
+                let condition = self.parse_func_expression(func, *condition)?;
+                let accept = self.parse_block(func, accept)?;
+                let reject = self.parse_block(func, reject)?;
+
+                Ok(quote! {
+                    if #condition {
+                        #accept
+                    } else {
+                        #reject
+                    }
+                })
+            },
+            Statement::Break => Ok(quote! { break; }),
+            Statement::Continue => Ok(quote! { continue; }),
+            Statement::Return { value } => {
+                if let Some(value) = value {
+                    let value = self.parse_func_expression(func, *value)?;
+                    Ok(quote! { return #value; })
+
+                } else {
+                    Ok(quote! { return; })
+                }
+            },
+            Statement::Call { function, arguments, result } => {
+                let function = &self.module.functions[*function];
+                let name = format_ident!("{}", function.name.as_ref().unwrap());
+
+                let arguments = arguments.into_iter().map(|argument| {
+                    self.parse_func_expression(func, *argument)
+                }).collect::<Result<Vec<_>, _>>()?;
+
+                if let Some(result) = result {
+                    let var_name = self.var_name(result);
+
+                    Ok(quote! {
+                        let #var_name = #name(#(#arguments),*);
+                    })
+
+                } else {
+                    Ok(quote! {
+                        #name(#(#arguments),*);
+                    })
+                }
+            },
+            Statement::Emit(range) => {
+                let emits = range.clone().into_iter().map(|handle| {
+                    //println!("{}", func.named_expressions[*handle]);
+
+                    let name = self.var_name(handle);
+                    let value = self.parse_func_expression(func, handle)?;
+
+                    Ok(quote! {
+                        let #name = #value;
+                    })
+                }).collect::<Result<Vec<_>, _>>()?;
+
+                Ok(quote! { #(#emits)* })
+            },
+            Statement::Store { pointer, value } => {
+                let pointer = self.parse_func_expression(func, *pointer)?;
+                let value = self.parse_func_expression(func, *value)?;
+                Ok(quote! { #pointer = #value; })
+            },
+            _ => {
+                println!("{:#?}", statement);
+                todo!();
+            },
+        }
+    }
+
+
+    fn parse_function_body(&self, function: &Function) -> Result<proc_macro2::TokenStream, GenerateError> {
+        self.parse_block(&function, &function.body)
     }
 
 
@@ -381,7 +588,7 @@ impl Generate {
                 constants.push(Constant {
                     name: name.to_string(),
                     ty: self.parse_type(constant.ty)?,
-                    value: self.parse_expression(&self.module.global_expressions, constant.init)?,
+                    value: self.parse_const_expression(&self.module.global_expressions, constant.init)?,
                 });
             }
         }
@@ -558,6 +765,10 @@ impl Generate {
 
                 let [x, y, z] = entry.workgroup_size;
 
+                println!("{:#?}", entry.function.named_expressions);
+
+                let cpu_body = self.parse_function_body(&entry.function)?;
+
                 Ok(quote! {
                     pub async fn #name(state: ::wgpu_compute::State<Bindings, Buffers>, threads: usize) {
                         fn #gpu_name(
@@ -605,7 +816,7 @@ impl Generate {
                             state: ::wgpu_compute::__internal::StateCpu<Bindings>,
                             threads: usize,
                         ) {
-                            ::std::todo!()
+                            #cpu_body
                         }
 
                         let state: ::wgpu_compute::__internal::State<Bindings, Buffers> = ::std::convert::Into::into(state);
