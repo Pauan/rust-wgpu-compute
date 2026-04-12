@@ -1,6 +1,8 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use quote::{quote, format_ident};
 use naga::{Arena, Handle, Span};
+use naga::valid::ModuleInfo;
 use naga::ir::*;
 
 use codespan_reporting::diagnostic::{Diagnostic, Label, LabelStyle};
@@ -80,11 +82,18 @@ impl std::fmt::Display for Var {
 }
 
 
+struct FunctionInfo<'a, 'b> {
+    function: &'a naga::ir::Function,
+    info: &'b naga::valid::FunctionInfo,
+}
+
+
 pub struct Generate {
     pub source: String,
     pub path: String,
     pub module: Module,
-    pub named_expressions: naga::FastIndexMap<Handle<Expression>, String>,
+    pub module_info: ModuleInfo,
+    pub named_expressions: RefCell<naga::FastIndexMap<Handle<Expression>, syn::Ident>>,
 }
 
 impl Generate {
@@ -119,14 +128,17 @@ impl Generate {
     }
 
 
-    fn var_name(&self, handle: Handle<Expression>) -> syn::Ident {
-        let name = Var(handle).to_string();
+    fn get_type<'a>(&'a self, info: &'a FunctionInfo, handle: Handle<Expression>) -> &'a TypeInner {
+        info.info[handle].ty.inner_with(&self.module.types)
+    }
 
-        let ident = format_ident!("{}", name);
 
-        //self.named_expressions.borrow_mut().insert(handle, name);
+    fn get_var(&self, handle: Handle<Expression>) -> Option<syn::Ident> {
+        self.named_expressions.borrow().get(&handle).cloned()
+    }
 
-        ident
+    fn set_var(&self, handle: Handle<Expression>, ident: syn::Ident) {
+        self.named_expressions.borrow_mut().insert(handle, ident);
     }
 
 
@@ -394,49 +406,67 @@ impl Generate {
     }
 
 
-    fn parse_func_expression(&self, func: &Function, handle: Handle<Expression>) -> Result<proc_macro2::TokenStream, GenerateError> {
-        let expression = &func.expressions[handle];
+    fn parse_func_expression(&self, info: &FunctionInfo, handle: Handle<Expression>) -> Result<proc_macro2::TokenStream, GenerateError> {
+        if let Some(name) = self.get_var(handle) {
+            return Ok(quote! { #name });
+        }
+
+        let expression = &info.function.expressions[handle];
 
         match expression {
-            Expression::CallResult(handle) => {
-                let function = &self.module.functions[*handle];
-
-                println!("{:#?}", function.named_expressions);
-
-                todo!();
+            // Handled by get_var
+            Expression::CallResult(_) => {
+                unreachable!();
             },
 
             Expression::AccessIndex { base, index } => {
-                let base = self.parse_func_expression(func, *base)?;
-                Ok(quote! { #base[#index] })
+                let ty = self.get_type(info, *base);
+
+                let ty = match ty {
+                    TypeInner::Pointer { base, .. } => &self.module.types[*base].inner,
+                    _ => ty,
+                };
+
+                let base = self.parse_func_expression(info, *base)?;
+
+                match ty {
+                    TypeInner::Struct { members, .. } => {
+                        let field = format_ident!("{}", members[*index as usize].name.as_ref().unwrap());
+                        Ok(quote! { #base.#field })
+                    },
+                    _ => {
+                        let index = *index as usize;
+                        Ok(quote! { #base[#index] })
+                    },
+                }
             },
 
             Expression::Access { base, index } => {
-                let base = self.parse_func_expression(func, *base)?;
-                let index = self.parse_func_expression(func, *index)?;
-                Ok(quote! { #base[#index] })
+                let base = self.parse_func_expression(info, *base)?;
+                let index = self.parse_func_expression(info, *index)?;
+                Ok(quote! { #base[#index as usize] })
             },
 
             Expression::Load { pointer } => {
-                let pointer = self.parse_func_expression(func, *pointer)?;
+                let pointer = self.parse_func_expression(info, *pointer)?;
                 Ok(quote! { #pointer })
             },
 
             Expression::GlobalVariable(handle) => {
                 let var = &self.module.global_variables[*handle];
-                let name = format_ident!("{}", var.name.as_ref().unwrap());
+                let name = format_ident!("write_{}", var.name.as_ref().unwrap());
 
-                Ok(quote! { #name })
+                Ok(quote! { __state__.#name() })
             },
 
             Expression::ArrayLength(handle) => {
-                let value = self.parse_func_expression(func, *handle)?;
-                Ok(quote! { #value.len() })
+                let value = self.parse_func_expression(info, *handle)?;
+                Ok(quote! { (#value.len() as u32) })
             },
 
             Expression::Binary { op, left, right } => {
-                let left = self.parse_func_expression(func, *left)?;
-                let right = self.parse_func_expression(func, *right)?;
+                let left = self.parse_func_expression(info, *left)?;
+                let right = self.parse_func_expression(info, *right)?;
 
                 Ok(match op {
                     BinaryOperator::Add => quote! { #left + #right },
@@ -461,42 +491,53 @@ impl Generate {
             },
 
             Expression::FunctionArgument(index) => {
-                let arg = &func.arguments[*index as usize];
-                let name = format_ident!("{}", arg.name.as_ref().unwrap());
-                Ok(quote! { #name })
+                let arg = &info.function.arguments[*index as usize];
+
+                match arg.binding {
+                    Some(Binding::BuiltIn(built_in)) => match built_in {
+                        BuiltIn::GlobalInvocationId => {
+                            Ok(quote! { __state__.global_id })
+                        },
+                        _ => todo!(),
+                    },
+                    _ => {
+                        let name = format_ident!("{}", arg.name.as_ref().unwrap());
+                        Ok(quote! { #name })
+                    },
+                }
             },
 
             Expression::Compose { ty, components } => {
                 let values = components.into_iter().map(|value| {
-                    self.parse_func_expression(func, *value)
+                    self.parse_func_expression(info, *value)
                 }).collect::<Result<Vec<_>, _>>()?;
 
-                self.parse_compose(func.expressions.get_span(handle), *ty, values)
+                self.parse_compose(info.function.expressions.get_span(handle), *ty, values)
             },
 
-            _ => self.parse_const_expression(&func.expressions, handle),
+            _ => self.parse_const_expression(&info.function.expressions, handle),
         }
     }
 
 
-    fn parse_block(&self, func: &Function, block: &Block) -> Result<proc_macro2::TokenStream, GenerateError> {
+    fn parse_block(&self, info: &FunctionInfo, block: &Block) -> Result<proc_macro2::TokenStream, GenerateError> {
         let statements = block.into_iter().map(|statement| {
-            self.parse_statement(func, statement)
+            self.parse_statement(info, statement)
         }).collect::<Result<Vec<_>, _>>()?;
 
         Ok(quote! { #(#statements)* })
     }
 
 
-    fn parse_statement(&self, func: &Function, statement: &Statement) -> Result<proc_macro2::TokenStream, GenerateError> {
+    fn parse_statement(&self, info: &FunctionInfo, statement: &Statement) -> Result<proc_macro2::TokenStream, GenerateError> {
         match statement {
             Statement::Block(block) => {
-                self.parse_block(func, block)
+                self.parse_block(info, block)
             },
             Statement::If { condition, accept, reject } => {
-                let condition = self.parse_func_expression(func, *condition)?;
-                let accept = self.parse_block(func, accept)?;
-                let reject = self.parse_block(func, reject)?;
+                let condition = self.parse_func_expression(info, *condition)?;
+                let accept = self.parse_block(info, accept)?;
+                let reject = self.parse_block(info, reject)?;
 
                 Ok(quote! {
                     if #condition {
@@ -510,7 +551,7 @@ impl Generate {
             Statement::Continue => Ok(quote! { continue; }),
             Statement::Return { value } => {
                 if let Some(value) = value {
-                    let value = self.parse_func_expression(func, *value)?;
+                    let value = self.parse_func_expression(info, *value)?;
                     Ok(quote! { return #value; })
 
                 } else {
@@ -519,31 +560,38 @@ impl Generate {
             },
             Statement::Call { function, arguments, result } => {
                 let function = &self.module.functions[*function];
-                let name = format_ident!("{}", function.name.as_ref().unwrap());
+
+                let name = format_ident!("{}_cpu_impl", function.name.as_ref().unwrap());
 
                 let arguments = arguments.into_iter().map(|argument| {
-                    self.parse_func_expression(func, *argument)
+                    self.parse_func_expression(&info, *argument)
                 }).collect::<Result<Vec<_>, _>>()?;
 
                 if let Some(result) = result {
-                    let var_name = self.var_name(result);
+                    let ident = format_ident!("{}", Var(*result).to_string());
+
+                    self.set_var(*result, ident.clone());
 
                     Ok(quote! {
-                        let #var_name = #name(#(#arguments),*);
+                        let #ident = #name(__state__, #(#arguments),*);
                     })
 
                 } else {
                     Ok(quote! {
-                        #name(#(#arguments),*);
+                        #name(__state__, #(#arguments),*);
                     })
                 }
             },
             Statement::Emit(range) => {
-                let emits = range.clone().into_iter().map(|handle| {
-                    //println!("{}", func.named_expressions[*handle]);
+                let emits = range.clone().into_iter().flat_map(|handle| {
+                    info.function.named_expressions.get(&handle).map(|name| {
+                        let name = format_ident!("{}", name);
+                        (name, handle)
+                    })
+                }).map(|(name, handle)| {
+                    let value = self.parse_func_expression(info, handle)?;
 
-                    let name = self.var_name(handle);
-                    let value = self.parse_func_expression(func, handle)?;
+                    self.set_var(handle, name.clone());
 
                     Ok(quote! {
                         let #name = #value;
@@ -553,8 +601,8 @@ impl Generate {
                 Ok(quote! { #(#emits)* })
             },
             Statement::Store { pointer, value } => {
-                let pointer = self.parse_func_expression(func, *pointer)?;
-                let value = self.parse_func_expression(func, *value)?;
+                let pointer = self.parse_func_expression(info, *pointer)?;
+                let value = self.parse_func_expression(info, *value)?;
                 Ok(quote! { #pointer = #value; })
             },
             _ => {
@@ -565,8 +613,8 @@ impl Generate {
     }
 
 
-    fn parse_function_body(&self, function: &Function) -> Result<proc_macro2::TokenStream, GenerateError> {
-        self.parse_block(&function, &function.body)
+    fn parse_function_body(&self, info: &FunctionInfo) -> Result<proc_macro2::TokenStream, GenerateError> {
+        self.parse_block(info, &info.function.body)
     }
 
 
@@ -627,13 +675,25 @@ impl Generate {
             quote! { pub #name: #ty, }
         }).collect::<Vec<_>>();
 
-        let buffers = variables.iter().flatten().map(|input| {
+        let cpu_buffers = variables.iter().flatten().map(|input| {
+            let name = format_ident!("{}", input.name);
+            let ty = input.ty.tokens();
+            quote! { pub #name: ::std::sync::Mutex<#ty>, }
+        }).collect::<Vec<_>>();
+
+        let gpu_buffers = variables.iter().flatten().map(|input| {
             let name = format_ident!("{}", input.name);
             let ty = input.ty.tokens();
             quote! { pub #name: ::wgpu_compute::Input<#ty>, }
         }).collect::<Vec<_>>();
 
-        let to_buffers = variables.iter().flatten().map(|input| {
+        let to_cpu_buffers = variables.iter().flatten().map(|input| {
+            let name = format_ident!("{}", input.name);
+
+            quote! { #name: ::std::sync::Mutex::new(self.#name), }
+        }).collect::<Vec<_>>();
+
+        let to_gpu_buffers = variables.iter().flatten().map(|input| {
             let name = format_ident!("{}", input.name);
 
             match input.ty {
@@ -643,6 +703,20 @@ impl Generate {
                 _ => {
                     quote! { #name: gpu.input(&self.#name), }
                 },
+            }
+        }).collect::<Vec<_>>();
+
+
+        let cpu_methods = variables.iter().flatten().map(|input| {
+            let name = format_ident!("{}", input.name);
+            let fn_name = format_ident!("write_{}", input.name);
+            let ty = input.ty.tokens();
+
+            quote! {
+                #[inline]
+                fn #fn_name(&self) -> ::std::sync::MutexGuard<'_, #ty> {
+                    self.state.buffers.#name.lock().unwrap()
+                }
             }
         }).collect::<Vec<_>>();
 
@@ -712,11 +786,15 @@ impl Generate {
                 #(#bindings)*
             }
 
-            pub struct Buffers {
-                #(#buffers)*
+            pub struct CpuBuffers {
+                #(#cpu_buffers)*
             }
 
-            impl Buffers {
+            pub struct GpuBuffers {
+                #(#gpu_buffers)*
+            }
+
+            impl GpuBuffers {
                 ::std::thread_local! {
                     static GPU_LAYOUT: ::std::cell::OnceCell<::wgpu_compute::__internal::GpuLayout> =
                         ::std::cell::OnceCell::new();
@@ -744,90 +822,165 @@ impl Generate {
                 }
             }
 
-            impl ::wgpu_compute::ToBuffers for Bindings {
-                type Output = Buffers;
+            impl ::wgpu_compute::IntoBuffers for Bindings {
+                type Cpu = CpuBuffers;
+                type Gpu = GpuBuffers;
 
-                fn to_buffers(&self, gpu: &::wgpu_compute::Gpu) -> Self::Output {
-                    Buffers {
-                        #(#to_buffers)*
+                fn into_cpu_buffers(self) -> Self::Cpu {
+                    CpuBuffers {
+                        #(#to_cpu_buffers)*
+                    }
+                }
+
+                fn into_gpu_buffers(self, gpu: &::wgpu_compute::Gpu) -> Self::Gpu {
+                    GpuBuffers {
+                        #(#to_gpu_buffers)*
                     }
                 }
             }
+
+            struct CpuState<'a> {
+                state: &'a ::wgpu_compute::__internal::StateCpu<CpuBuffers>,
+                global_id: [u32; 3],
+            }
+
+            impl<'a> CpuState<'a> {
+                #(#cpu_methods)*
+            }
         };
 
-        let functions = self.module.entry_points.iter().map(|entry| {
+        let functions = self.module.functions.iter().map(|(handle, function)| {
+            let cpu_name = format_ident!("{}_cpu_impl", function.name.as_ref().unwrap());
+
+            let info = FunctionInfo {
+                function: &function,
+                info: &self.module_info[handle],
+            };
+
+            let cpu_body = self.parse_function_body(&info)?;
+
+            let mut arguments = function.arguments.iter().map(|arg| {
+                let name = format_ident!("{}", arg.name.as_ref().unwrap());
+                let ty = self.parse_type(arg.ty)?;
+                let ty = ty.tokens();
+                Ok(quote! { #name: #ty })
+            }).collect::<Result<Vec<_>, GenerateError>>()?;
+
+            arguments.insert(0, quote! {
+                __state__: &CpuState<'a>
+            });
+
+            if let Some(result) = &function.result {
+                let ty = self.parse_type(result.ty)?;
+                let ty = ty.tokens();
+
+                Ok(quote! {
+                    fn #cpu_name<'a>(#(#arguments),*) -> #ty {
+                        #cpu_body
+                    }
+                })
+
+            } else {
+                Ok(quote! {
+                    fn #cpu_name<'a>(#(#arguments),*) {
+                        #cpu_body
+                    }
+                })
+            }
+        }).collect::<Result<Vec<proc_macro2::TokenStream>, GenerateError>>()?;
+
+        let entry_points = self.module.entry_points.iter().enumerate().map(|(index, entry)| {
             if let ShaderStage::Compute = entry.stage {
                 let entry_name = &entry.name;
 
                 let name = format_ident!("{}", entry.name);
                 let gpu_name = format_ident!("{}_gpu", entry.name);
                 let cpu_name = format_ident!("{}_cpu", entry.name);
+                let cpu_impl_name = format_ident!("{}_cpu_impl", entry.name);
 
                 let [x, y, z] = entry.workgroup_size;
 
-                println!("{:#?}", entry.function.named_expressions);
+                let info = FunctionInfo {
+                    function: &entry.function,
+                    info: &self.module_info.get_entry_point(index),
+                };
 
-                let cpu_body = self.parse_function_body(&entry.function)?;
+                let cpu_body = self.parse_function_body(&info)?;
 
                 Ok(quote! {
-                    pub async fn #name(state: ::wgpu_compute::State<Bindings, Buffers>, threads: usize) {
-                        fn #gpu_name(
-                            state: ::wgpu_compute::__internal::StateGpu<Buffers>,
-                            threads: usize,
-                        ) -> impl ::std::future::Future<Output = ()> + use<> {
-                            ::std::thread_local! {
-                                static GPU_FN: ::std::cell::OnceCell<::wgpu_compute::__internal::GpuFn> =
-                                    ::std::cell::OnceCell::new();
-                            }
+                    fn #cpu_impl_name<'a>(__state__: &CpuState<'a>) {
+                        #cpu_body
+                    }
 
-                            Buffers::GPU_LAYOUT.with(|gpu_layout| {
-                                let gpu_layout = Buffers::gpu_layout(&state.gpu, gpu_layout);
+                    pub fn #cpu_name(
+                        state: ::wgpu_compute::StateCpu<CpuBuffers>,
+                        threads: u32,
+                    ) {
+                        use ::rayon::iter::{ParallelIterator, IntoParallelIterator};
 
-                                GPU_FN.with(|gpu_fn| {
-                                    let gpu_fn = gpu_fn.get_or_init(|| {
-                                        ::wgpu_compute::__internal::GpuFn::new(
-                                            &state.gpu,
-                                            gpu_layout,
-                                            [#x, #y, #z],
-                                            #entry_name,
-                                        )
-                                    });
+                        let state: ::wgpu_compute::__internal::StateCpu<CpuBuffers> = ::std::convert::Into::into(state);
 
-                                    let mut encoder = state.buffers.bind_group(|bind_group| {
-                                        ::wgpu_compute::__internal::command_encoder(
-                                            &state.gpu,
-                                            gpu_layout,
-                                            gpu_fn,
-                                            threads,
-                                            bind_group,
-                                        )
-                                    });
-
-                                    for (input, output) in state.copy_buffers {
-                                        ::wgpu_compute::__internal::copy_input_to_output(&mut encoder, &input, &output);
-                                    }
-
-                                    ::wgpu_compute::__internal::wait(&state.gpu, encoder)
-                                })
+                        (0u32..threads).into_par_iter().for_each(|index| {
+                            #cpu_impl_name(&CpuState {
+                                state: &state,
+                                global_id: [index, 0, 0],
                             })
+                        });
+                    }
+
+                    pub fn #gpu_name(
+                        state: ::wgpu_compute::StateGpu<GpuBuffers>,
+                        threads: u32,
+                    ) -> impl ::std::future::Future<Output = ()> + use<> {
+                        let state: ::wgpu_compute::__internal::StateGpu<GpuBuffers> = ::std::convert::Into::into(state);
+
+                        ::std::thread_local! {
+                            static GPU_FN: ::std::cell::OnceCell<::wgpu_compute::__internal::GpuFn> =
+                                ::std::cell::OnceCell::new();
                         }
 
-                        fn #cpu_name(
-                            state: ::wgpu_compute::__internal::StateCpu<Bindings>,
-                            threads: usize,
-                        ) {
-                            #cpu_body
-                        }
+                        GpuBuffers::GPU_LAYOUT.with(|gpu_layout| {
+                            let gpu_layout = GpuBuffers::gpu_layout(&state.gpu, gpu_layout);
 
-                        let state: ::wgpu_compute::__internal::State<Bindings, Buffers> = ::std::convert::Into::into(state);
+                            GPU_FN.with(|gpu_fn| {
+                                let gpu_fn = gpu_fn.get_or_init(|| {
+                                    ::wgpu_compute::__internal::GpuFn::new(
+                                        &state.gpu,
+                                        gpu_layout,
+                                        [#x, #y, #z],
+                                        #entry_name,
+                                    )
+                                });
 
-                        match state {
-                            ::wgpu_compute::__internal::State::Gpu(state) => {
-                                #gpu_name(state, threads).await
-                            },
-                            ::wgpu_compute::__internal::State::Cpu(state) => {
-                                #cpu_name(state, threads)
-                            },
+                                let mut encoder = state.buffers.bind_group(|bind_group| {
+                                    ::wgpu_compute::__internal::command_encoder(
+                                        &state.gpu,
+                                        gpu_layout,
+                                        gpu_fn,
+                                        threads,
+                                        bind_group,
+                                    )
+                                });
+
+                                for (input, output) in state.copy_buffers {
+                                    ::wgpu_compute::__internal::copy_input_to_output(&mut encoder, &input, &output);
+                                }
+
+                                ::wgpu_compute::__internal::wait(&state.gpu, encoder)
+                            })
+                        })
+                    }
+
+                    pub fn #name(state: ::wgpu_compute::State<Bindings>, threads: u32) -> impl ::std::future::Future<Output = ()> + use<> {
+                        async move {
+                            match state {
+                                ::wgpu_compute::State::Gpu(state) => {
+                                    #gpu_name(state, threads).await
+                                },
+                                ::wgpu_compute::State::Cpu(state) => {
+                                    #cpu_name(state, threads)
+                                },
+                            }
                         }
                     }
                 })
@@ -845,6 +998,8 @@ impl Generate {
             #bindings
 
             #(#functions)*
+
+            #(#entry_points)*
         })
     }
 }

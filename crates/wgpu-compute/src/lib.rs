@@ -213,64 +213,59 @@ impl<A> Output<Vec<A>> where A: bytemuck::AnyBitPattern {
 }
 
 
-pub trait ToBuffers {
-    type Output;
+pub trait IntoBuffers {
+    type Cpu;
+    type Gpu;
 
-    fn to_buffers(&self, gpu: &Gpu) -> Self::Output;
+    fn into_cpu_buffers(self) -> Self::Cpu;
+
+    fn into_gpu_buffers(self, gpu: &Gpu) -> Self::Gpu;
 }
 
 
 #[repr(transparent)]
-pub struct State<A, B>(__internal::State<A, B>);
+pub struct StateCpu<A>(__internal::StateCpu<A>);
 
-impl<A, B> State<A, B> {
-    pub fn new(bindings: A) -> impl Future<Output = Self> + use<A, B> where A: ToBuffers<Output = B> {
+impl<A> StateCpu<A> {
+    pub fn new<B>(bindings: B) -> Self where B: IntoBuffers<Cpu = A> {
+        Self(__internal::StateCpu {
+            buffers: bindings.into_cpu_buffers(),
+        })
+    }
+}
+
+impl<A> Into<__internal::StateCpu<A>> for StateCpu<A> {
+    #[inline]
+    fn into(self) -> __internal::StateCpu<A> {
+        self.0
+    }
+}
+
+
+#[repr(transparent)]
+pub struct StateGpu<A>(__internal::StateGpu<A>);
+
+impl<A> StateGpu<A> {
+    fn new_with_gpu(buffers: A, gpu: Gpu) -> Self {
+        Self(__internal::StateGpu {
+            buffers,
+            copy_buffers: vec![],
+            gpu,
+        })
+    }
+
+    pub fn new<B>(bindings: B) -> impl Future<Output = Option<Self>> + use<A, B>
+        where B: IntoBuffers<Gpu = A> {
+
         async move {
             match Gpu::get().await {
-                Some(gpu) => {
-                    Self(__internal::State::Gpu(__internal::StateGpu {
-                        buffers: bindings.to_buffers(&gpu),
-                        copy_buffers: vec![],
-                        gpu,
-                    }))
-                },
-
-                None => {
-                    Self(__internal::State::Cpu(__internal::StateCpu {
-                        bindings,
-                    }))
-                },
+                Some(gpu) => Some(Self::new_with_gpu(bindings.into_gpu_buffers(&gpu), gpu)),
+                None => None,
             }
         }
     }
 
-    pub fn gpu_only(bindings: A) -> impl Future<Output = Self> + use<A, B> where A: ToBuffers<Output = B> {
-        async move {
-            match Gpu::get().await {
-                Some(gpu) => {
-                    Self(__internal::State::Gpu(__internal::StateGpu {
-                        buffers: bindings.to_buffers(&gpu),
-                        copy_buffers: vec![],
-                        gpu,
-                    }))
-                },
-
-                None => {
-                    panic!("GPU is not available");
-                },
-            }
-        }
-    }
-
-    pub fn cpu_only(bindings: A) -> impl Future<Output = Self> + use<A, B> where A: ToBuffers<Output = B> {
-        async move {
-            Self(__internal::State::Cpu(__internal::StateCpu {
-                bindings,
-            }))
-        }
-    }
-
-    pub fn output<C, F>(&mut self, f: F) -> Output<C> where F: FnOnce(&B) -> &Input<C> {
+    /*pub fn output<B, F>(&mut self, f: F) -> Output<B> where F: FnOnce(&A) -> &Input<B> {
         match &mut self.0 {
             __internal::State::Gpu(state) => {
                 let (input, output) = state.gpu.input_output(f(&state.buffers));
@@ -286,13 +281,30 @@ impl<A, B> State<A, B> {
                 todo!();
             },
         }
+    }*/
+}
+
+impl<A> Into<__internal::StateGpu<A>> for StateGpu<A> {
+    #[inline]
+    fn into(self) -> __internal::StateGpu<A> {
+        self.0
     }
 }
 
-impl<A, B> From<State<A, B>> for __internal::State<A, B> {
-    #[inline]
-    fn from(state: State<A, B>) -> Self {
-        state.0
+
+pub enum State<A> where A: IntoBuffers {
+    Cpu(StateCpu<A::Cpu>),
+    Gpu(StateGpu<A::Gpu>),
+}
+
+impl<A> State<A> where A: IntoBuffers {
+    pub fn new(bindings: A) -> impl Future<Output = Self> + use<A> {
+        async move {
+            match Gpu::get().await {
+                Some(gpu) => Self::Gpu(StateGpu::new_with_gpu(bindings.into_gpu_buffers(&gpu), gpu)),
+                None => Self::Cpu(StateCpu::new(bindings)),
+            }
+        }
     }
 }
 
@@ -305,7 +317,7 @@ pub mod __internal {
 
 
     pub struct StateCpu<A> {
-        pub bindings: A,
+        pub buffers: A,
     }
 
 
@@ -313,12 +325,6 @@ pub mod __internal {
         pub buffers: B,
         pub gpu: Gpu,
         pub copy_buffers: Vec<(wgpu::Buffer, wgpu::Buffer)>,
-    }
-
-
-    pub enum State<A, B> {
-        Cpu(StateCpu<A>),
-        Gpu(StateGpu<B>),
     }
 
 
@@ -387,7 +393,7 @@ pub mod __internal {
         gpu: &Gpu,
         layout: &GpuLayout,
         gpu_fn: &GpuFn,
-        threads: usize,
+        threads: u32,
         bindings: &[&[wgpu::BindGroupEntry]],
     ) -> wgpu::CommandEncoder {
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -413,7 +419,7 @@ pub mod __internal {
             // Splits the work into multiple workgroups based on the `threads`
             // e.g. if `threads` is 64, and the number of arguments is 320, then
             // it will dispatch 5 workgroups, and each workgroup will have 64 threads.
-            let workgroup_count = threads.div_ceil(gpu_fn.threads as usize) as u32;
+            let workgroup_count = threads.div_ceil(gpu_fn.threads);
 
             compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
         }

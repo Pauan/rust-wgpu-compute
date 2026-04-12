@@ -129,7 +129,8 @@ impl Input {
             source: module.source,
             path: module.path,
             module: module.module,
-            named_expressions: naga::FastIndexMap::default(),
+            module_info: info,
+            named_expressions: Default::default(),
         };
 
         Ok(generate

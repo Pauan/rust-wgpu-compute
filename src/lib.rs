@@ -10,18 +10,19 @@ mod gpu {
 
 
 async fn double(values: Vec<gpu::Input>) -> Vec<gpu::Output> {
-    let threads = values.len();
+    let threads = values.len() as u32;
 
     let mut state = wgpu_compute::State::new(gpu::Bindings {
         output: vec![Zeroable::zeroed(); values.len()],
         input: values,
     }).await;
 
-    let output = state.output(|bindings| &bindings.output);
+    //let output = state.bindings.output.read();
 
     gpu::double(state, threads).await;
 
-    output.to_vec()
+    vec![]
+    //output.to_vec()
 }
 
 
