@@ -17,12 +17,11 @@ async fn double(values: Vec<gpu::Input>) -> Vec<gpu::Output> {
         input: values,
     }).await;
 
-    //let output = state.bindings.output.read();
+    let output = state.bindings().output.read();
 
     gpu::double(state, threads).await;
 
-    vec![]
-    //output.to_vec()
+    output.to_vec()
 }
 
 
