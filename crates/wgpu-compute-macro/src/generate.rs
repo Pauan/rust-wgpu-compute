@@ -669,42 +669,24 @@ impl Generate {
         }).collect::<Vec<_>>();
 
 
-        let bindings = variables.iter().flatten().map(|input| {
-            let name = format_ident!("{}", input.name);
-            let ty = input.ty.tokens();
-            quote! { pub #name: #ty, }
-        }).collect::<Vec<_>>();
+        fn map_variables<F>(variables: &[Vec<Variable>], mut f: F) -> Vec<proc_macro2::TokenStream>
+            where F: FnMut(syn::Ident, Cow<'_, proc_macro2::TokenStream>) -> proc_macro2::TokenStream {
 
-        let cpu_buffers = variables.iter().flatten().map(|input| {
-            let name = format_ident!("{}", input.name);
-            let ty = input.ty.tokens();
-            quote! { pub #name: ::std::sync::Mutex<#ty>, }
-        }).collect::<Vec<_>>();
+            variables.iter().flatten().map(|input| {
+                let name = format_ident!("{}", input.name);
+                let ty = input.ty.tokens();
+                f(name, ty)
+            }).collect()
+        }
 
-        let gpu_buffers = variables.iter().flatten().map(|input| {
-            let name = format_ident!("{}", input.name);
-            let ty = input.ty.tokens();
-            quote! { pub #name: ::wgpu_compute::Input<#ty>, }
-        }).collect::<Vec<_>>();
+        fn map_names<F>(variables: &[Vec<Variable>], mut f: F) -> Vec<proc_macro2::TokenStream>
+            where F: FnMut(syn::Ident) -> proc_macro2::TokenStream {
 
-        let to_cpu_buffers = variables.iter().flatten().map(|input| {
-            let name = format_ident!("{}", input.name);
-
-            quote! { #name: ::std::sync::Mutex::new(self.#name), }
-        }).collect::<Vec<_>>();
-
-        let to_gpu_buffers = variables.iter().flatten().map(|input| {
-            let name = format_ident!("{}", input.name);
-
-            match input.ty {
-                RustType::Vec { .. } => {
-                    quote! { #name: gpu.input_vec(self.#name.as_slice()), }
-                },
-                _ => {
-                    quote! { #name: gpu.input(&self.#name), }
-                },
-            }
-        }).collect::<Vec<_>>();
+            variables.iter().flatten().map(|input| {
+                let name = format_ident!("{}", input.name);
+                f(name)
+            }).collect()
+        }
 
 
         let cpu_methods = variables.iter().flatten().map(|input| {
@@ -721,123 +703,289 @@ impl Generate {
         }).collect::<Vec<_>>();
 
 
-        let bind_group_layouts = variables.iter().map(|group| {
-            let group = group.into_iter().map(|input| {
-                let size_of = input.ty.single_size_of();
-                let binding = input.binding;
+        let bindings = {
+            let fields = map_variables(&variables, |name, ty| quote! {
+                #name: #ty,
+            });
 
-                let space = match input.space {
-                    AddressSpace::Uniform => {
-                        quote! { ::wgpu::BufferBindingType::Uniform }
-                    },
-                    AddressSpace::Storage { access } => {
-                        let read_only = !access.contains(StorageAccess::STORE);
+            quote! {
+                pub struct Bindings {
+                    #(#fields)*
+                }
+            }
+        };
 
-                        quote! { ::wgpu::BufferBindingType::Storage { read_only: #read_only } }
+
+        let cpu_buffers = {
+            let fields = map_variables(&variables, |name, ty| quote! {
+                #name: ::std::sync::Arc<::std::sync::Mutex<#ty>>,
+            });
+
+            let into_buffers = map_names(&variables, |name| quote! {
+                #name: ::std::sync::Arc::new(::std::sync::Mutex::new(self.#name)),
+            });
+
+            quote! {
+                struct CpuBuffers {
+                    #(#fields)*
+                }
+
+                impl ::wgpu_compute::cpu::IntoBuffersCpu for Bindings {
+                    type Buffers = CpuBuffers;
+
+                    fn into_cpu_buffers(self) -> Self::Buffers {
+                        CpuBuffers {
+                            #(#into_buffers)*
+                        }
+                    }
+                }
+            }
+        };
+
+
+        let gpu_buffers = {
+            let fields = map_variables(&variables, |name, ty| quote! {
+                #name: ::wgpu_compute::gpu::BufferGpu<#ty>,
+            });
+
+            let into_buffers = variables.iter().flatten().map(|input| {
+                let name = format_ident!("{}", input.name);
+
+                match input.ty {
+                    RustType::Vec { .. } => {
+                        quote! { #name: gpu.input_vec(self.#name.as_slice()), }
                     },
                     _ => {
-                        todo!();
+                        quote! { #name: gpu.input(&self.#name), }
                     },
-                };
+                }
+            }).collect::<Vec<_>>();
 
-                quote! {
-                    ::wgpu::BindGroupLayoutEntry {
-                        binding: #binding,
-                        visibility: ::wgpu::ShaderStages::COMPUTE,
-                        ty: ::wgpu::BindingType::Buffer {
-                            ty: #space,
-                            has_dynamic_offset: false,
-                            min_binding_size: ::std::option::Option::Some(
-                                ::std::num::NonZeroU64::new(#size_of as u64).unwrap()
-                            ),
+            let bind_group_layouts = variables.iter().map(|group| {
+                let group = group.into_iter().map(|input| {
+                    let size_of = input.ty.single_size_of();
+                    let binding = input.binding;
+
+                    let space = match input.space {
+                        AddressSpace::Uniform => {
+                            quote! { ::wgpu::BufferBindingType::Uniform }
                         },
-                        count: ::std::option::Option::None,
-                    },
-                }
-            }).collect::<Vec<_>>();
+                        AddressSpace::Storage { access } => {
+                            let read_only = !access.contains(StorageAccess::STORE);
 
-            quote! {
-                &[#(#group)*]
-            }
-        }).collect::<Vec<_>>();
+                            quote! { ::wgpu::BufferBindingType::Storage { read_only: #read_only } }
+                        },
+                        _ => {
+                            todo!();
+                        },
+                    };
 
-
-        let bind_groups = variables.iter().map(|group| {
-            let group = group.into_iter().map(|input| {
-                let name = format_ident!("{}", input.name);
-                let binding = input.binding;
+                    quote! {
+                        ::wgpu::BindGroupLayoutEntry {
+                            binding: #binding,
+                            visibility: ::wgpu::ShaderStages::COMPUTE,
+                            ty: ::wgpu::BindingType::Buffer {
+                                ty: #space,
+                                has_dynamic_offset: false,
+                                min_binding_size: ::std::option::Option::Some(
+                                    ::std::num::NonZeroU64::new(#size_of as u64).unwrap()
+                                ),
+                            },
+                            count: ::std::option::Option::None,
+                        },
+                    }
+                }).collect::<Vec<_>>();
 
                 quote! {
-                    ::wgpu::BindGroupEntry {
-                        binding: #binding,
-                        resource: ::wgpu_compute::Gpu::bind_group(&self.#name),
-                    },
+                    &[#(#group)*]
+                }
+            }).collect::<Vec<_>>();
+
+            let bind_groups = variables.iter().map(|group| {
+                let group = group.into_iter().map(|input| {
+                    let name = format_ident!("{}", input.name);
+                    let binding = input.binding;
+
+                    quote! {
+                        ::wgpu::BindGroupEntry {
+                            binding: #binding,
+                            resource: ::wgpu_compute::Gpu::bind_group(&self.#name),
+                        },
+                    }
+                }).collect::<Vec<_>>();
+
+                quote! {
+                    &[#(#group)*]
                 }
             }).collect::<Vec<_>>();
 
             quote! {
-                &[#(#group)*]
+                struct GpuBuffers {
+                    #(#fields)*
+                }
+
+                impl ::wgpu_compute::gpu::IntoBuffersGpu for Bindings {
+                    type Buffers = GpuBuffers;
+
+                    fn into_gpu_buffers(self, gpu: &::wgpu_compute::gpu::Gpu) -> Self::Buffers {
+                        GpuBuffers {
+                            #(#into_buffers)*
+                        }
+                    }
+                }
+
+                impl GpuBuffers {
+                    ::std::thread_local! {
+                        static GPU_LAYOUT: ::std::cell::OnceCell<::wgpu_compute::__internal::GpuLayout> =
+                            ::std::cell::OnceCell::new();
+                    }
+
+                    fn gpu_layout<'a>(
+                        gpu: &::wgpu_compute::Gpu,
+                        layout: &'a ::std::cell::OnceCell<::wgpu_compute::__internal::GpuLayout>,
+                    ) -> &'a ::wgpu_compute::__internal::GpuLayout {
+                        layout.get_or_init(|| {
+                            ::wgpu_compute::__internal::GpuLayout::new(
+                                gpu,
+                                #source,
+                                &[
+                                    #(#bind_group_layouts)*
+                                ],
+                            )
+                        })
+                    }
+
+                    fn bind_group<A, F>(&self, f: F) -> A where F: FnOnce(&[&[::wgpu::BindGroupEntry]]) -> A {
+                        f(&[
+                            #(#bind_groups)*
+                        ])
+                    }
+                }
             }
-        }).collect::<Vec<_>>();
+        };
+
+
+        let cpu_bindings = {
+            let fields = map_variables(&variables, |name, ty| quote! {
+                #name: ::wgpu_compute::cpu::BindingCpu<'a, #ty>,
+            });
+
+            let bindings = map_names(&variables, |name| quote! {
+                #name: BindingCpu::new(&self.buffers.#name),
+            });
+
+            quote! {
+                struct CpuBindings<'a> {
+                    #(#fields)*
+                }
+
+                impl ::wgpu_compute::Bindings for ::wgpu_compute::cpu::StateCpu<Bindings> {
+                    type Output<'a> = CpuBindings<'a>;
+
+                    fn bindings(&self) -> Self::Output<'a> {
+                        CpuBindings {
+                            #(#bindings)*
+                        }
+                    }
+                }
+            }
+        };
+
+
+        let gpu_bindings = {
+            let fields = map_variables(&variables, |name, ty| quote! {
+                #name: ::wgpu_compute::gpu::BindingGpu<'a, GpuBuffers, #ty>,
+            });
+
+            let bindings = map_names(&variables, |name| quote! {
+                #name: BindingGpu::new(&self.__internal(), &self.__internal().buffers.#name),
+            });
+
+            quote! {
+                struct GpuBindings<'a> {
+                    #(#fields)*
+                }
+
+                impl ::wgpu_compute::Bindings for ::wgpu_compute::gpu::StateGpu<Bindings> {
+                    type Output<'a> = GpuBindings<'a>;
+
+                    fn bindings(&self) -> Self::Output<'a> {
+                        GpuBindings {
+                            #(#bindings)*
+                        }
+                    }
+                }
+            }
+        };
+
+
+        let output_bindings = {
+            let fields = map_variables(&variables, |name, ty| quote! {
+                #name: ::wgpu_compute::Binding<'a, GpuBuffers, #ty>,
+            });
+
+            let gpu_bindings = map_names(&variables, |name| quote! {
+                #name: ::wgpu_compute::Binding::Gpu(
+                    BindingGpu::new(&self.__internal(), &self.__internal().buffers.#name)
+                ),
+            });
+
+            let cpu_bindings = map_names(&variables, |name| quote! {
+                #name: ::wgpu_compute::Binding::Cpu(
+                    BindingCpu::new(&self.buffers.#name)
+                ),
+            });
+
+            quote! {
+                struct OutputBindings<'a> {
+                    #(#fields)*
+                }
+
+                impl ::wgpu_compute::Bindings for ::wgpu_compute::State<Bindings> {
+                    type Output<'a> = OutputBindings<'a>;
+
+                    fn bindings(&self) -> Self::Output<'a> {
+                        match self {
+                            ::wgpu_compute::State::Gpu(gpu) => OutputBindings {
+                                #(#gpu_bindings)*
+                            },
+                            ::wgpu_compute::State::Cpu(cpu) => OutputBindings {
+                                #(#cpu_bindings)*
+                            },
+                        }
+                    }
+                }
+            }
+        };
+
+
+        let methods = {
+            let methods = self.module.functions.iter().map(|(handle, function)| {
+
+            }).collect::<Result<Vec<proc_macro2::TokenStream>, GenerateError>>()?;
+
+
+            trait Methods {
+                #(#methods)*
+
+                fn make(&self) -> impl Future<Output = i32> + Send;
+            }
+        };
 
 
         let bindings = quote! {
-            pub struct Bindings {
-                #(#bindings)*
-            }
+            #bindings
+            #cpu_buffers
+            #gpu_buffers
+            #cpu_bindings
+            #gpu_bindings
+            #output_bindings
+            #methods
+            #cpu_methods
+            #gpu_methods
+            #both_methods
 
-            pub struct CpuBuffers {
-                #(#cpu_buffers)*
-            }
 
-            pub struct GpuBuffers {
-                #(#gpu_buffers)*
-            }
-
-            impl GpuBuffers {
-                ::std::thread_local! {
-                    static GPU_LAYOUT: ::std::cell::OnceCell<::wgpu_compute::__internal::GpuLayout> =
-                        ::std::cell::OnceCell::new();
-                }
-
-                fn gpu_layout<'a>(
-                    gpu: &::wgpu_compute::Gpu,
-                    layout: &'a ::std::cell::OnceCell<::wgpu_compute::__internal::GpuLayout>,
-                ) -> &'a ::wgpu_compute::__internal::GpuLayout {
-                    layout.get_or_init(|| {
-                        ::wgpu_compute::__internal::GpuLayout::new(
-                            gpu,
-                            #source,
-                            &[
-                                #(#bind_group_layouts)*
-                            ],
-                        )
-                    })
-                }
-
-                fn bind_group<A, F>(&self, f: F) -> A where F: FnOnce(&[&[::wgpu::BindGroupEntry]]) -> A {
-                    f(&[
-                        #(#bind_groups)*
-                    ])
-                }
-            }
-
-            impl ::wgpu_compute::IntoBuffers for Bindings {
-                type Cpu = CpuBuffers;
-                type Gpu = GpuBuffers;
-
-                fn into_cpu_buffers(self) -> Self::Cpu {
-                    CpuBuffers {
-                        #(#to_cpu_buffers)*
-                    }
-                }
-
-                fn into_gpu_buffers(self, gpu: &::wgpu_compute::Gpu) -> Self::Gpu {
-                    GpuBuffers {
-                        #(#to_gpu_buffers)*
-                    }
-                }
-            }
 
             struct CpuState<'a> {
                 state: &'a ::wgpu_compute::__internal::StateCpu<CpuBuffers>,

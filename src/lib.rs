@@ -1,5 +1,5 @@
 use wasm_bindgen::prelude::*;
-use bytemuck::Zeroable;
+use wgpu_compute::{State, empty_vec};
 
 
 mod gpu {
@@ -12,14 +12,14 @@ mod gpu {
 async fn double(values: Vec<gpu::Input>) -> Vec<gpu::Output> {
     let threads = values.len() as u32;
 
-    let mut state = wgpu_compute::State::new(gpu::Bindings {
-        output: vec![Zeroable::zeroed(); values.len()],
+    let state = State::new(gpu::Bindings {
+        output: empty_vec(values.len()),
         input: values,
     }).await;
 
     let output = state.bindings().output.read();
 
-    gpu::double(state, threads).await;
+    state.double(threads).await;
 
     output.to_vec()
 }

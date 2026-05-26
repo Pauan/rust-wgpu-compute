@@ -1,22 +1,35 @@
-use std::cell::RefCell;
-use std::sync::Mutex;
-use std::marker::PhantomData;
-use bytemuck::NoUninit;
-
 pub use wgpu_compute_macro::import_wgpu_compute;
+use bytemuck::Zeroable;
 
 mod util;
+pub mod cpu;
+pub mod gpu;
 //mod buffer;
 
-//pub use buffer::*;
+use cpu::IntoBuffersCpu;
+use gpu::IntoBuffersGpu;
 
 
-pub enum Read<'a, A> {
-    Gpu(ReadGpu<A>),
-    Cpu(ReadCpu<'a, A>),
+// TODO replace with Vec::from_fn after it stabilizes
+pub fn empty_vec<A>(len: usize) -> Vec<A> where A: Zeroable {
+    (0..len).map(|_| Zeroable::zeroed()).collect()
 }
 
-impl<'a, A> Read<'a, A> where A: Clone {
+
+pub trait Bindings {
+    type Output<'a> where Self: 'a;
+
+    fn bindings<'a>(&'a self) -> Self::Output<'a>;
+}
+
+
+#[derive(Debug)]
+pub enum Read<A> {
+    Gpu(gpu::ReadGpu<A>),
+    Cpu(cpu::ReadCpu< A>),
+}
+
+impl<A> Read<A> where A: Clone + bytemuck::AnyBitPattern {
     pub fn value(&self) -> A {
         match self {
             Self::Gpu(gpu) => gpu.value(),
@@ -25,7 +38,7 @@ impl<'a, A> Read<'a, A> where A: Clone {
     }
 }
 
-impl<'a, A> Read<'a, Vec<A>> where A: Clone {
+impl<A> Read<Vec<A>> where A: Clone + bytemuck::AnyBitPattern {
     pub fn to_vec(&self) -> Vec<A> {
         match self {
             Self::Gpu(gpu) => gpu.to_vec(),
@@ -35,14 +48,15 @@ impl<'a, A> Read<'a, Vec<A>> where A: Clone {
 }
 
 
-pub enum Binding<'a, A> {
-    Gpu(BindingGpu<'a, A>),
-    Cpu(BindingCpu<'a, A>),
+#[derive(Debug)]
+pub enum Binding<'a, GpuBuffers, A> {
+    Gpu(gpu::BindingGpu<'a, GpuBuffers, A>),
+    Cpu(cpu::BindingCpu<'a, A>),
 }
 
-impl<'a, A> Binding<'a, A> {
+impl<'a, GpuBuffers, A> Binding<'a, GpuBuffers, A> {
     #[inline]
-    pub fn read(&self) -> Read<'_, A> {
+    pub fn read(&self) -> Read<A> {
         match self {
             Self::Gpu(gpu) => Read::Gpu(gpu.read()),
             Self::Cpu(cpu) => Read::Cpu(cpu.read()),
@@ -51,45 +65,24 @@ impl<'a, A> Binding<'a, A> {
 }
 
 
-pub trait IntoBuffersGpu {
-    type Buffers;
-
-    fn into_buffers(self, gpu: &Gpu) -> Self::Buffers;
-}
-
-
-pub trait IntoBuffersCpu {
-    type Buffers;
-
-    fn into_buffers(self) -> Self::Buffers;
-}
-
-
-pub trait Bindings<A> {
-    type Output<'a>;
-
-    fn bindings<'a>(state: &'a A) -> Self::Output<'a>;
-}
-
-
 pub enum State<A> where A: IntoBuffersGpu + IntoBuffersCpu {
-    Gpu(StateGpu<<A as IntoBuffersGpu>::Buffers>),
-    Cpu(StateCpu<<A as IntoBuffersCpu>::Buffers>),
+    Gpu(gpu::StateGpu<A>),
+    Cpu(cpu::StateCpu<A>),
 }
 
 impl<A> State<A> where A: IntoBuffersGpu + IntoBuffersCpu {
     pub fn new(bindings: A) -> impl Future<Output = Self> + use<A> {
         async move {
-            match Gpu::get().await {
-                Some(gpu) => Self::Gpu(StateGpu::new_with_gpu(IntoBuffersGpu::into_buffers(bindings, &gpu), gpu)),
-                None => Self::Cpu(StateCpu::new(bindings)),
+            match gpu::Gpu::get().await {
+                Some(gpu) => Self::Gpu(gpu::StateGpu::new_with_gpu(IntoBuffersGpu::into_buffers_gpu(bindings, &gpu), gpu)),
+                None => Self::Cpu(cpu::StateCpu::new(bindings)),
             }
         }
     }
 
     #[inline]
-    pub fn bindings<B>(&self) -> B::Output where B: Bindings<Self> {
-        B::bindings(self)
+    pub fn bindings<'a>(&'a self) -> <Self as Bindings>::Output<'a> where Self: Bindings {
+        <Self as Bindings>::bindings(self)
     }
 }
 

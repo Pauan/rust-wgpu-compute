@@ -1,4 +1,17 @@
-#[derive(Clone)]
+use std::marker::PhantomData;
+use std::cell::RefCell;
+use bytemuck::NoUninit;
+use crate::Bindings;
+
+
+pub trait IntoBuffersGpu {
+    type Buffers;
+
+    fn into_buffers_gpu(self, gpu: &Gpu) -> Self::Buffers;
+}
+
+
+#[derive(Debug, Clone)]
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -37,9 +50,9 @@ impl Gpu {
     }
 
 
-    fn get() -> impl Future<Output = Option<Self>> + use<> {
+    pub(crate) fn get() -> impl Future<Output = Option<Self>> + use<> {
         thread_local! {
-            static GPU: RefCell<util::Loading<Option<Gpu>>> = RefCell::new(util::Loading::Init);
+            static GPU: RefCell<crate::util::Loading<Option<Gpu>>> = RefCell::new(crate::util::Loading::Init);
         }
 
         async move {
@@ -125,18 +138,27 @@ impl Gpu {
 }
 
 
+#[doc(hidden)]
+#[derive(Debug)]
 pub struct BufferGpu<A> {
     buffer: wgpu::Buffer,
     _phantom: PhantomData<A>,
 }
 
 
+#[derive(Debug)]
 pub struct BindingGpu<'a, Buffers, A> {
-    state: &'a StateGpu<Buffers>,
+    state: &'a __internal::StateGpu<Buffers>,
     buffer: &'a BufferGpu<A>,
 }
 
 impl<'a, Buffers, A> BindingGpu<'a, Buffers, A> {
+    #[doc(hidden)]
+    #[inline]
+    pub fn new(state: &'a __internal::StateGpu<Buffers>, buffer: &'a BufferGpu<A>) -> Self {
+        Self { state, buffer }
+    }
+
     #[inline]
     pub fn read(&self) -> ReadGpu<A> {
         self.state.copy_buffer(&self.buffer.buffer)
@@ -144,6 +166,7 @@ impl<'a, Buffers, A> BindingGpu<'a, Buffers, A> {
 }
 
 
+#[derive(Debug)]
 pub struct ReadGpu<A> {
     buffer: wgpu::Buffer,
     _phantom: PhantomData<A>,
@@ -164,70 +187,71 @@ impl<A> ReadGpu<Vec<A>> where A: bytemuck::AnyBitPattern {
 }
 
 
+#[derive(Debug)]
 #[non_exhaustive]
-pub struct StateGpu<A> {
-    #[doc(hidden)]
-    pub buffers: A,
+pub struct StateGpu<A>(__internal::StateGpu<A::Buffers>) where A: IntoBuffersGpu;
 
-    #[doc(hidden)]
-    pub gpu: Gpu,
-
-    #[doc(hidden)]
-    pub copy_buffers: RefCell<Vec<(wgpu::Buffer, wgpu::Buffer)>>,
-}
-
-impl<A> StateGpu<A> {
-    fn new_with_gpu(buffers: A, gpu: Gpu) -> Self {
-        Self {
+impl<A> StateGpu<A> where A: IntoBuffersGpu {
+    pub(crate) fn new_with_gpu(buffers: A::Buffers, gpu: Gpu) -> Self {
+        Self(__internal::StateGpu {
             buffers,
             gpu,
             copy_buffers: RefCell::new(vec![]),
-        }
+        })
     }
 
-    pub fn new<B>(bindings: B) -> impl Future<Output = Option<Self>> + use<A, B>
-        where B: IntoBuffersGpu {
-
+    pub fn new(bindings: A) -> impl Future<Output = Option<Self>> + use<A> {
         async move {
             match Gpu::get().await {
-                Some(gpu) => Some(Self::new_with_gpu(bindings.into_buffers(&gpu), gpu)),
+                Some(gpu) => Some(Self::new_with_gpu(bindings.into_buffers_gpu(&gpu), gpu)),
                 None => None,
             }
         }
     }
 
     #[inline]
-    pub fn bindings<B>(&self) -> B::Output where B: Bindings<Self> {
-        B::bindings(self)
-    }
-
-
-    #[doc(hidden)]
-    pub fn binding<A>(&self, buffer: &BufferGpu<A>) -> BindingGpu<'_, A> {
-        BindingGpu {
-            state: self,
-            buffer: buffer,
-            _phantom: PhantomData,
-        }
+    pub fn bindings<'a>(&'a self) -> <Self as Bindings>::Output<'a> where Self: Bindings {
+        <Self as Bindings>::bindings(self)
     }
 
     #[doc(hidden)]
-    pub fn copy_buffer<A, F>(&self, input_buffer: &wgpu::Buffer) -> ReadGpu<A> {
-        let ouput_buffer = self.gpu.output_buffer(input_buffer);
-
-        self.copy_buffers.borrow_mut().push((input_buffer.clone(), output_buffer.clone()));
-
-        ReadGpu {
-            buffer: output_buffer,
-            _phantom: PhantomData,
-        }
+    #[inline]
+    pub fn __internal(&self) -> &__internal::StateGpu<A::Buffers> {
+        &self.0
     }
 }
 
 
 #[doc(hidden)]
 pub mod __internal {
+    use super::{Gpu, ReadGpu};
+    use std::cell::RefCell;
+    use std::marker::PhantomData;
     use crate::util::make_empty_callback;
+
+
+    #[derive(Debug)]
+    pub struct StateGpu<A> {
+        pub buffers: A,
+
+        pub gpu: Gpu,
+
+        pub copy_buffers: RefCell<Vec<(wgpu::Buffer, wgpu::Buffer)>>,
+    }
+
+    impl<A> StateGpu<A> {
+        pub fn copy_buffer<B>(&self, input_buffer: &wgpu::Buffer) -> ReadGpu<B> {
+            let output_buffer = self.gpu.output_buffer(input_buffer);
+
+            self.copy_buffers.borrow_mut().push((input_buffer.clone(), output_buffer.clone()));
+
+            ReadGpu {
+                buffer: output_buffer,
+                _phantom: PhantomData,
+            }
+        }
+    }
+
 
     pub struct GpuLayout {
         shader: wgpu::ShaderModule,
